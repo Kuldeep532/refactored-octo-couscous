@@ -1,0 +1,133 @@
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Only process /gateway/v1/* routes
+    if (!url.pathname.startsWith('/gateway/v1/')) {
+      return new Response(JSON.stringify({ error: 'Not Found' }), { status: 404 });
+    }
+
+    // CORS Handling
+    const allowedOrigins = ['https://your-app-domain.com'];
+    const origin = request.headers.get('origin');
+    const corsHeaders = {
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Target, X-Secret-Name, X-Auth-Type, CF-Access-Client-Id, CF-Access-Client-Secret',
+    };
+
+    if (allowedOrigins.includes(origin)) {
+      corsHeaders['Access-Control-Allow-Origin'] = origin;
+    }
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    try {
+      // 1. Cloudflare Zero Trust Access Validation (Incoming Request Check)
+      const clientId = request.headers.get('CF-Access-Client-Id');
+      const clientSecret = request.headers.get('CF-Access-Client-Secret');
+
+      if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+        if (clientId !== env.CF_ACCESS_CLIENT_ID || clientSecret !== env.CF_ACCESS_CLIENT_SECRET) {
+          return new Response(JSON.stringify({ error: 'Unauthorized: Invalid Zero Trust Credentials' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
+      }
+
+      let targetBaseUrl = request.headers.get('x-api-target');
+      const secretName = request.headers.get('x-secret-name');
+      const authType = request.headers.get('x-auth-type') || 'Bearer';
+
+      // 2. Dual Source Fetch: Read API Key & Target URL from Environment Variables OR KV Store (API_REGISTRY)
+      let apiKey = null;
+
+      if (secretName) {
+        if (!/^[a-zA-Z0-9_-]+$/.test(secretName)) {
+          return new Response(JSON.stringify({ error: 'Invalid X-Secret-Name format' }), { status: 400 });
+        }
+
+        // Source 1: Worker Environment Variable
+        apiKey = env[secretName];
+
+        // Source 2: Cloudflare Workers KV Store (API_REGISTRY)
+        if (!apiKey && env.API_REGISTRY) {
+          apiKey = await env.API_REGISTRY.get(secretName);
+        }
+
+        // KV fallback for target URL if header is missing
+        if (!targetBaseUrl && env.API_REGISTRY) {
+          targetBaseUrl = await env.API_REGISTRY.get(`${secretName}_URL`);
+        }
+
+        if (!apiKey) {
+          return new Response(JSON.stringify({ error: 'Secret not found in Environment or KV Store' }), { status: 404 });
+        }
+      }
+
+      if (!targetBaseUrl) {
+        return new Response(JSON.stringify({ error: 'X-Api-Target header or KV URL mapping is missing' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // Extract Path & Query Strings
+      const path = url.pathname.replace('/gateway/v1/', '');
+      const fullUrl = `${targetBaseUrl.replace(/\/$/, '')}/${path}${url.search}`;
+
+      // URL Validation & SSRF Check
+      const parsedUrl = new URL(fullUrl);
+      if (parsedUrl.protocol !== 'https:') {
+        return new Response(JSON.stringify({ error: 'Only HTTPS protocol is allowed' }), { status: 400 });
+      }
+
+      const isPrivateIp = /^(localhost|127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|169\.254\.)/.test(parsedUrl.hostname);
+      if (isPrivateIp) {
+        return new Response(JSON.stringify({ error: 'Access to internal network forbidden' }), { status: 403 });
+      }
+
+      // Base Headers for Forward Request
+      const forwardHeaders = new Headers();
+      forwardHeaders.set('Content-Type', 'application/json');
+
+      if (apiKey) {
+        if (authType === 'Bearer') forwardHeaders.set('Authorization', `Bearer ${apiKey}`);
+        else if (authType === 'ApiKey') forwardHeaders.set('x-api-key', apiKey);
+        else if (authType === 'Basic') forwardHeaders.set('Authorization', `Basic ${btoa(apiKey)}`);
+        else forwardHeaders.set('Authorization', apiKey);
+      }
+
+      // Request Body Processing
+      let body = null;
+      if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
+        body = await request.text();
+      }
+
+      // Execute Subrequest
+      const response = await fetch(fullUrl, {
+        method: request.method,
+        headers: forwardHeaders,
+        body: body
+      });
+
+      const responseData = await response.text();
+      
+      return new Response(responseData, {
+        status: response.status,
+        headers: {
+          'Content-Type': 'application/json',
+          ...corsHeaders
+        }
+      });
+
+    } catch (error) {
+      return new Response(JSON.stringify({ error: 'Gateway Execution Error', message: error.message }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+  }
+};
