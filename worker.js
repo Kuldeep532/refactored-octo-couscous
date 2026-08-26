@@ -10,7 +10,6 @@ const MAX_REQUESTS_PER_MINUTE = 60;
 function buildCorsHeaders(origin, env) {
   const allowedOrigins = (env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
   const isAllowed = allowedOrigins.length === 0 ? true : allowedOrigins.includes(origin);
-
   return {
     'Access-Control-Allow-Origin': isAllowed ? (origin || '*') : 'null',
     'Access-Control-Allow-Methods': ALLOWED_METHODS.join(', '),
@@ -26,7 +25,10 @@ function buildCorsHeaders(origin, env) {
 function jsonError(message, status, corsHeaders) {
   return new Response(JSON.stringify({ error: message }), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    headers: {
+      'Content-Type': 'application/json',
+      ...corsHeaders
+    }
   });
 }
 
@@ -56,13 +58,10 @@ function resolveProvider(env, providerName) {
 // Custom Rate Limiter using Cloudflare KV/Binding fallback
 async function checkRateLimit(identifier, env) {
   if (env.RATE_LIMITER) {
-    // Direct Cloudflare Rate Limiting Binding support
     const { success } = await env.RATE_LIMITER.limit({ key: identifier });
     return success;
   }
-  
   if (env.GATEWAY_KV) {
-    // Cloudflare KV based Rate Limiting
     const key = `ratelimit:${identifier}`;
     const current = Number(await env.GATEWAY_KV.get(key) || 0);
     if (current >= MAX_REQUESTS_PER_MINUTE) {
@@ -71,8 +70,7 @@ async function checkRateLimit(identifier, env) {
     await env.GATEWAY_KV.put(key, (current + 1).toString(), { expirationTtl: 60 });
     return true;
   }
-
-  return true; // Pass through if no KV/Limiter is attached yet
+  return true;
 }
 
 export default {
@@ -89,6 +87,30 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // [Fix for Test 3.3] Token Validation Route Setup
+    if (url.pathname === '/v1/token/validate' && request.method === 'POST') {
+      const authHeader = request.headers.get('Authorization');
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return jsonError('Unauthorized', 401, corsHeaders);
+      }
+      const token = authHeader.split(' ')[1];
+      const userResponse = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'apikey': env.SUPABASE_ANON_KEY
+        }
+      });
+      if (!userResponse.ok) {
+        return jsonError('Invalid or Expired Token', 401, corsHeaders);
+      }
+      const userData = await userResponse.json();
+      return new Response(JSON.stringify({ valid: true, user: userData }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+
     if (!url.pathname.startsWith('/gateway/v1/')) {
       return jsonError('Endpoint Not Found', 404, corsHeaders);
     }
@@ -99,6 +121,12 @@ export default {
       const isAllowedRate = await checkRateLimit(clientIp, env);
       if (!isAllowedRate) {
         return jsonError('Too Many Requests. Please slow down.', 429, corsHeaders);
+      }
+
+      // [Fix for Test 2.4] Provider Header Check BEFORE Token Authentication
+      const providerName = (request.headers.get('X-Target-Provider') || '').trim().toLowerCase();
+      if (!providerName || !/^[a-z0-9_]+$/.test(providerName)) {
+        return jsonError('Invalid or Missing X-Target-Provider Header', 400, corsHeaders);
       }
 
       // 2. Supabase Auth Validation
@@ -126,18 +154,13 @@ export default {
       const userData = await userResponse.json();
       const userId = userData?.id || clientIp;
 
-      // User-level Rate Limit check (secondary security layer)
+      // User-level Rate Limit check
       const isAllowedUser = await checkRateLimit(`user:${userId}`, env);
       if (!isAllowedUser) {
         return jsonError('User Rate Limit Exceeded.', 429, corsHeaders);
       }
 
       // 3. Resolve Provider
-      const providerName = (request.headers.get('X-Target-Provider') || '').trim().toLowerCase();
-      if (!providerName || !/^[a-z0-9_]+$/.test(providerName)) {
-        return jsonError('Invalid or Missing X-Target-Provider Header', 400, corsHeaders);
-      }
-
       const provider = resolveProvider(env, providerName);
       if (!provider) {
         return jsonError('Unknown Provider', 403, corsHeaders);
@@ -166,12 +189,13 @@ export default {
       // 6. Upstream Headers Setup & Key Masking
       const reqHeaders = new Headers();
       const forbiddenHeaders = ['host', 'authorization', 'x-target-provider', 'apikey', 'cookie', 'x-api-key', 'cf-connecting-ip', 'cf-ray'];
-      
+
       for (const [key, value] of request.headers.entries()) {
         if (!forbiddenHeaders.includes(key.toLowerCase())) {
           reqHeaders.set(key, value);
         }
       }
+
       reqHeaders.set('Content-Type', request.headers.get('Content-Type') || 'application/json');
 
       if (provider.authStyle === 'bearer') {
@@ -206,7 +230,7 @@ export default {
         clearTimeout(timeoutId);
       }
 
-      // 8. Stream Response Friendly Return (Prevents breaking streaming LLM calls)
+      // 8. Stream Response Friendly Return
       const upstreamType = response.headers.get('Content-Type') || 'application/json';
       const safeType = upstreamType.startsWith('text/html') ? 'text/plain; charset=utf-8' : upstreamType;
 
