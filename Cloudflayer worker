@@ -1,21 +1,14 @@
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+  async fetch(request, env) {
+    // 1. Static Allowed Origins (CORS Security Fix)
+    const origin = request.headers.get('origin');
+    const allowedOrigins = [env.ALLOWED_ORIGIN || 'https://yourdomain.com'];
+    const corsOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
 
-    // 1. Route Check
-    if (!url.pathname.startsWith('/gateway/v1/')) {
-      return new Response(JSON.stringify({ error: 'Endpoint Not Found' }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // 2. CORS Setup
-    const clientOrigin = request.headers.get('origin');
     const corsHeaders = {
+      'Access-Control-Allow-Origin': corsOrigin,
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Target, X-Secret-Name, X-Auth-Type, X-App-Signature, X-App-Timestamp',
-      'Access-Control-Allow-Origin': clientOrigin || '*',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY'
     };
@@ -24,139 +17,84 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    try {
-      // 3. HMAC Verification Setup
-      const signature = request.headers.get('X-App-Signature');
-      const timestamp = request.headers.get('X-App-Timestamp');
-      const appSecret = env.APP_HMAC_SECRET;
-
-      if (!signature || !timestamp || !appSecret) {
-        return new Response(JSON.stringify({ error: 'Unauthorized: Missing Critical Security Headers' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 4. Anti-Replay Mechanism (60 Seconds Expiry)
-      const now = Date.now();
-      const requestTime = parseInt(timestamp, 10);
-      if (isNaN(requestTime) || Math.abs(now - requestTime) > 60000) {
-        return new Response(JSON.stringify({ error: 'Unauthorized: Request Expired or Clock Skew' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 5. Payload SHA-256 Hash
-      let bodyText = '';
-      if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
-        bodyText = await request.text();
-      }
-
-      const encoder = new TextEncoder();
-      const bodyHashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(bodyText));
-      const bodyHashHex = Array.from(new Uint8Array(bodyHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-
-      // 6. Sign Verification (Method + Path + Timestamp + BodyHash)
-      const canonicalString = `${request.method}:${url.pathname}:${timestamp}:${bodyHashHex}`;
-      
-      const hmacKey = await crypto.subtle.importKey(
-        'raw',
-        encoder.encode(appSecret),
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['verify']
-      );
-
-      const isValidSignature = await crypto.subtle.verify(
-        'HMAC',
-        hmacKey,
-        hexToBytes(signature),
-        encoder.encode(canonicalString)
-      );
-
-      if (!isValidSignature) {
-        return new Response(JSON.stringify({ error: 'Unauthorized: Invalid Cryptographic Signature' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
-      }
-
-      // 7. Secret & Target URL Retrieval
-      let targetBaseUrl = request.headers.get('x-api-target');
-      const secretName = request.headers.get('x-secret-name');
-      const authType = request.headers.get('x-auth-type') || 'Bearer';
-      let apiKey = null;
-
-      if (secretName) {
-        if (!/^[a-zA-Z0-9_-]+$/.test(secretName)) {
-          return new Response(JSON.stringify({ error: 'Invalid X-Secret-Name format' }), { status: 400, headers: corsHeaders });
-        }
-        apiKey = env[secretName];
-        if (!apiKey && env.API_REGISTRY) apiKey = await env.API_REGISTRY.get(secretName);
-        if (!targetBaseUrl && env.API_REGISTRY) targetBaseUrl = await env.API_REGISTRY.get(`${secretName}_URL`);
-        
-        if (!apiKey) {
-          return new Response(JSON.stringify({ error: 'Target API Secret not found' }), { status: 404, headers: corsHeaders });
-        }
-      }
-
-      if (!targetBaseUrl) {
-        return new Response(JSON.stringify({ error: 'Target API URL not specified' }), { status: 400, headers: corsHeaders });
-      }
-
-      // 8. SSRF Protection
-      const path = url.pathname.replace('/gateway/v1/', '');
-      const fullUrl = `${targetBaseUrl.replace(/\/$/, '')}/${path}${url.search}`;
-      const parsedUrl = new URL(fullUrl);
-
-      if (parsedUrl.protocol !== 'https:') {
-        return new Response(JSON.stringify({ error: 'Insecure Outbound Protocol (Only HTTPS Allowed)' }), { status: 400, headers: corsHeaders });
-      }
-
-      const isPrivateIp = /^(localhost|127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|169\.254\.)/.test(parsedUrl.hostname);
-      if (isPrivateIp) {
-        return new Response(JSON.stringify({ error: 'Access to Internal IP Address Forbidden' }), { status: 403, headers: corsHeaders });
-      }
-
-      // 9. Forward Request
-      const forwardHeaders = new Headers();
-      forwardHeaders.set('Content-Type', 'application/json');
-
-      if (apiKey) {
-        if (authType === 'Bearer') forwardHeaders.set('Authorization', `Bearer ${apiKey}`);
-        else if (authType === 'ApiKey') forwardHeaders.set('x-api-key', apiKey);
-        else if (authType === 'Basic') forwardHeaders.set('Authorization', `Basic ${btoa(apiKey)}`);
-        else forwardHeaders.set('Authorization', apiKey);
-      }
-
-      const response = await fetch(fullUrl, {
-        method: request.method,
-        headers: forwardHeaders,
-        body: ['GET', 'HEAD'].includes(request.method) ? null : bodyText
-      });
-
-      const responseData = await response.text();
-      return new Response(responseData, {
-        status: response.status,
+    // 2. Route Check
+    const url = new URL(request.url);
+    if (!url.pathname.startsWith('/gateway/v1/')) {
+      return new Response(JSON.stringify({ error: 'Endpoint Not Found' }), {
+        status: 404,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
+    }
 
-    } catch (error) {
-      return new Response(JSON.stringify({ error: 'Gateway Execution Error', details: error.message }), {
+    try {
+      // 3. Strict Auth Check
+      const authHeader = request.headers.get('Authorization');
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
+        return new Response(JSON.stringify({ error: 'Server Auth Configuration Error' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      const token = authHeader.split(' ')[1];
+      const userResponse = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'apikey': env.SUPABASE_ANON_KEY
+        }
+      });
+
+      if (!userResponse.ok) {
+        return new Response(JSON.stringify({ error: 'Invalid or Expired Token' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      // 4. Secure Target Routing (Eliminates Open Proxy & SSRF Risks)
+      if (!env.DEFAULT_TARGET_URL) {
+        return new Response(JSON.stringify({ error: 'Target Service Not Configured' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
+      const path = url.pathname.replace(/^\/gateway\/v1\/?/, '');
+      const targetUrl = new URL(path + url.search, env.DEFAULT_TARGET_URL);
+
+      // 5. Safe Request Forwarding
+      const reqHeaders = new Headers();
+      reqHeaders.set('Content-Type', request.headers.get('Content-Type') || 'application/json');
+      reqHeaders.set('Authorization', `Bearer ${token}`);
+
+      const response = await fetch(targetUrl.toString(), {
+        method: request.method,
+        headers: reqHeaders,
+        body: ['GET', 'HEAD'].includes(request.method) ? null : await request.text()
+      });
+
+      const data = await response.text();
+      return new Response(data, {
+        status: response.status,
+        headers: {
+          'Content-Type': response.headers.get('Content-Type') || 'application/json',
+          ...corsHeaders
+        }
+      });
+
+    } catch (err) {
+      // 6. Generic Error Response (Prevents Info Leakage)
+      return new Response(JSON.stringify({ error: 'Internal Gateway Error' }), {
         status: 500,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     }
   }
 };
-
-function hexToBytes(hex) {
-  if (hex.length % 2 !== 0) return new Uint8Array(0);
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
-  }
-  return bytes;
-}
-
