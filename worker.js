@@ -1,6 +1,7 @@
 // Dynamic & Secure Cloudflare API Gateway with Rate Limiting
 const ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'];
-const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5MB limit
+const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5MB limit standard
+const MAX_MEDIA_BODY_BYTES = 50 * 1024 * 1024; // Extended 50MB limit for Video/Media/Audio
 const UPSTREAM_TIMEOUT_MS = 30000;
 const VALID_AUTH_STYLES = ['bearer', 'x-api-key', 'query'];
 
@@ -13,7 +14,7 @@ function buildCorsHeaders(origin, env) {
   return {
     'Access-Control-Allow-Origin': isAllowed ? (origin || '*') : 'null',
     'Access-Control-Allow-Methods': ALLOWED_METHODS.join(', '),
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Target-Provider, Cache-Control',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Target-Provider, Cache-Control, X-File-Mime-Type',
     'Vary': 'Origin',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
@@ -73,6 +74,25 @@ async function checkRateLimit(identifier, env) {
   return true;
 }
 
+// Helper to poll Gemini File status until ACTIVE or FAILED
+async function pollFileActiveState(getFileUrl, maxAttempts = 15, delayMs = 2000) {
+  for (let i = 0; i < maxAttempts; i++) {
+    const res = await fetch(getFileUrl);
+    if (res.ok) {
+      const fileData = await res.json();
+      const state = fileData.state || fileData.file?.state;
+      if (state === 'ACTIVE') {
+        return fileData.file || fileData;
+      }
+      if (state === 'FAILED') {
+        throw new Error('Media processing failed on Gemini server.');
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+  throw new Error('Media processing timeout. File took too long to activate.');
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') || '';
@@ -88,7 +108,7 @@ export default {
 
     const url = new URL(request.url);
 
-    // [Fix for Test 3.3] Token Validation Route Setup
+    // Token Validation Route
     if (url.pathname === '/v1/token/validate' && request.method === 'POST') {
       const authHeader = request.headers.get('Authorization');
       if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -111,6 +131,85 @@ export default {
       });
     }
 
+    // Audio/Video/Media Gateway Route: Upload -> Processing Poll -> Active State Return
+    if (url.pathname === '/v1/media/upload' && request.method === 'POST') {
+      // Rate Limit Checks
+      const clientIp = request.headers.get('cf-connecting-ip') || 'unknown';
+      const isAllowedIp = await checkRateLimit(`ip:media:${clientIp}`, env);
+      if (!isAllowedIp) {
+        return jsonError('Too Many Requests. Please slow down.', 429, corsHeaders);
+      }
+
+      const authHeader = request.headers.get('Authorization');
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return jsonError('Unauthorized', 401, corsHeaders);
+      }
+      const token = authHeader.split(' ')[1];
+      const userResponse = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'apikey': env.SUPABASE_ANON_KEY
+        }
+      });
+      if (!userResponse.ok) {
+        return jsonError('Invalid or Expired Token', 401, corsHeaders);
+      }
+
+      const userData = await userResponse.json();
+      const userId = userData?.id || clientIp;
+      const isAllowedUser = await checkRateLimit(`user:media:${userId}`, env);
+      if (!isAllowedUser) {
+        return jsonError('User Rate Limit Exceeded.', 429, corsHeaders);
+      }
+
+      const contentLength = Number(request.headers.get('Content-Length') || 0);
+      if (contentLength > MAX_MEDIA_BODY_BYTES) {
+        return jsonError('Payload Exceeds Maximum Allowed Limit (50MB)', 413, corsHeaders);
+      }
+
+      const geminiProvider = resolveProvider(env, 'gemini');
+      if (!geminiProvider || geminiProvider.error) {
+        return jsonError('Gemini Provider Configuration Error', 500, corsHeaders);
+      }
+
+      const mediaBuffer = await request.arrayBuffer();
+      const mimeType = request.headers.get('X-File-Mime-Type') || 'audio/mp3';
+
+      // 1. Initial Raw Upload
+      const uploadUrl = `${geminiProvider.baseUrl}/upload/v1beta/files?key=${geminiProvider.apiKey}`;
+      const uploadResponse = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'X-Goog-Upload-Protocol': 'raw',
+          'X-Goog-Upload-Header-Content-Type': mimeType,
+          'Content-Type': mimeType
+        },
+        body: mediaBuffer
+      });
+
+      if (!uploadResponse.ok) {
+        return jsonError('Failed to upload media stream to Gemini Provider', 502, corsHeaders);
+      }
+
+      const uploadData = await uploadResponse.json();
+      let fileObject = uploadData.file || uploadData;
+
+      // 2. Poll file state if in PROCESSING state (Solves Audio/Video processing delays)
+      if (fileObject.state === 'PROCESSING') {
+        try {
+          const getFileUrl = `${geminiProvider.baseUrl}/v1beta/${fileObject.name}?key=${geminiProvider.apiKey}`;
+          fileObject = await pollFileActiveState(getFileUrl);
+        } catch (pollErr) {
+          return jsonError(pollErr.message || 'Media processing failed', 504, corsHeaders);
+        }
+      }
+
+      return new Response(JSON.stringify({ success: true, file: fileObject }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    }
+
     if (!url.pathname.startsWith('/gateway/v1/')) {
       return jsonError('Endpoint Not Found', 404, corsHeaders);
     }
@@ -123,7 +222,7 @@ export default {
         return jsonError('Too Many Requests. Please slow down.', 429, corsHeaders);
       }
 
-      // [Fix for Test 2.4] Provider Header Check BEFORE Token Authentication
+      // Provider Header Check BEFORE Token Authentication
       const providerName = (request.headers.get('X-Target-Provider') || '').trim().toLowerCase();
       if (!providerName || !/^[a-z0-9_]+$/.test(providerName)) {
         return jsonError('Invalid or Missing X-Target-Provider Header', 400, corsHeaders);
